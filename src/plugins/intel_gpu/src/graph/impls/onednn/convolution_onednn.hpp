@@ -89,10 +89,20 @@ struct ConvolutionImplementationManager : public ImplementationManager {
         bool f16_conv = everyone_is(data_types::f16, in_dt, wei_dt) && one_of(out_dt, {data_types::f16, data_types::bf16, data_types::f32, data_types::u8, data_types::i8});
         bool bf16_conv = everyone_is(data_types::bf16, in_dt, wei_dt) &&
                          one_of(out_dt, {data_types::f16, data_types::bf16, data_types::f32, data_types::u8, data_types::i8});
+        // oneDNN's jit convolution accepts an f32 forward problem (see
+        // data_types_ok() in conv/jit/config.cpp, which only rejects f64/fp8/fp4),
+        // so f32 no longer has to fall back to the ocl path. The primitive attrs
+        // are left at the default fpmath mode of strict, which means oneDNN keeps
+        // the f32 math instead of down-converting to tf32, so the fma kind stays
+        // mad rather than dpas. That is intentional: inference_precision f32 is a
+        // request for f32 arithmetic, and dropping to tf32 would silently cut the
+        // mantissa from 23 to 10 bits.
+        bool f32_conv = everyone_is(data_types::f32, in_dt, wei_dt) &&
+                        one_of(out_dt, {data_types::f16, data_types::bf16, data_types::f32, data_types::u8, data_types::i8});
         bool int8_conv = one_of(in_dt, {data_types::i8, data_types::u8}) && one_of(wei_dt, {data_types::i8, data_types::u8}) &&
                          one_of(out_dt, {data_types::i32, data_types::f16, data_types::bf16, data_types::f32, data_types::u8, data_types::i8});
 
-        if (!f16_conv && !bf16_conv && !int8_conv)
+        if (!f16_conv && !bf16_conv && !f32_conv && !int8_conv)
             return false;
 
         if (!is_supported_post_ops(conv_node))

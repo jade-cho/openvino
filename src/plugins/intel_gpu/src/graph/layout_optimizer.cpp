@@ -1146,7 +1146,13 @@ format layout_optimizer::get_expected_format(convolution_node const& node) {
     }
 
     bool onednn_valid_post_ops = get_post_ops_count(node) <= 32;
-    bool use_onednn_impls = contains_onednn_impls_optimization_attribute(&node) && input_layout.data_type != data_types::f32;
+    // No dtype filter here: f32 used to be excluded so that it took the native ocl
+    // path, but onednn::ConvolutionImplementationManager now accepts f32 as well,
+    // and excluding it here would leave the node on a blocked native format while
+    // the onednn impl gets picked anyway - i.e. the format choice and the impl
+    // choice would disagree. get_expected_format and validate_impl have to stay
+    // consistent about which dtypes go to onednn.
+    bool use_onednn_impls = contains_onednn_impls_optimization_attribute(&node);
 
     // Use planar bfyx format for dynamic convolutions with explicit padding in clDNN
     if (node.is_dynamic() && output_layout.get_partial_shape().size() == 4 && node.use_explicit_padding() && !i8_u8_input &&
@@ -1520,7 +1526,17 @@ format layout_optimizer::get_preferred_format(program_node& node) {
                 }
             }
         } else { // gemm
-            if (!use_onednn_impls && !allow_new_shape_infer) {
+            // The plain-format enforcement is skipped when onednn is in use because
+            // onednn::GemmImplementationManager::query_formats then supplies the formats.
+            // But that only holds if the onednn impl actually accepts this node -
+            // its validate_impl rejects f32/i64 inputs, so an f32 gemm still runs on
+            // an ocl kernel that requires a plain format, with nobody asking for one.
+            // Before f32 convolution was allowed on onednn that never showed up, since
+            // the producing conv kept the tensor planar anyway; now the conv hands over
+            // a blocked (and feature-padded) layout and the ocl gemm reads out of range.
+            auto onednn_gemm_supports_dtypes = !one_of(node.get_input_layout(0).data_type, {data_types::f32, data_types::i64}) &&
+                                               !one_of(node.get_input_layout(1).data_type, {data_types::f32, data_types::i64});
+            if ((!use_onednn_impls || !onednn_gemm_supports_dtypes) && !allow_new_shape_infer) {
                 // Plain input format is enforced because gemm opt kernels allow only plain formats.
                 expected = format::get_default_format(node.get_output_layout(false).get_rank());
                 node.set_preferred_input_fmt(0, expected);
