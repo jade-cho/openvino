@@ -164,8 +164,7 @@ INSTANTIATE_TEST_SUITE_P(smoke_paged_attention_token_type_micro_sdpa_prefill,
 //     golden | -                    | compared             |
 //
 // past_len is picked so the query chunk holds text tokens only. A bidirectional pair needs both the
-// query and the key to be image tokens, so a text-only chunk is masked purely causally - which is
-// what both MIXED kernels produce, neither of them implementing token_type_ids.
+// query and the key to be image tokens, so a text-only chunk is masked purely causally.
 class paged_attention_token_type_micro_sdpa_mixed_test : public paged_attention_token_type_test {
 public:
     void apply_mixed_test_data(PagedAttentionManager& pam, const paged_attention_token_type_test_params& p, const test::TestData& data) {
@@ -192,7 +191,7 @@ public:
         const auto query_data = to_float16(data.qData);
         pam.query_data = {std::vector<ov::float16>(query_data.begin() + past_len * hidden_dim, query_data.end())};
 
-        pam.token_type_ids.assign(data.tokenTypes.begin(), data.tokenTypes.end());
+        pam.token_type_ids.assign(data.tokenTypes.begin() + past_len, data.tokenTypes.end());
     }
 };
 
@@ -254,6 +253,7 @@ static std::vector<paged_attention_token_type_test_params> make_micro_sdpa_mixed
 
         auto p = make_token_type_test_param(data, ENABLE_FA_V2);
         p.subsequences = {{static_cast<int>(data.tokenTypes.size()) - past_len, past_len}};
+        p.token_type_ids = std::vector<int>(data.tokenTypes.begin() + past_len, data.tokenTypes.end());
         params.push_back(p);
     }
     return params;

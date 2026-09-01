@@ -202,6 +202,11 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     const int past_len = past_lens[gws_mapping];
     const int k = q + past_len;
 #endif
+#if HAS_TOKEN_TYPE_IDS && !IS_PREFILL
+    /* token_type_ids describes the scheduled chunk only, so a sequence-global
+       position p is valid iff p >= past_len and maps to ttid_base + p. */
+    const int ttid_base = (int)subsequence_begin - past_len;
+#endif
     const int d = HEAD_SIZE;
 #if IS_GQA_SINGLE_TOKEN
     q *= KV_GROUP_SIZE;
@@ -250,6 +255,21 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         }
         causal_k = bidir_causal_k;
     }
+    #elif HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION && !IS_GQA_SINGLE_TOKEN
+    /* Same extension for chunked prefill (MIXED). Queries of this WG occupy
+       sequence-global [past_len + wg_j0, causal_k), so the last one is causal_k - 1. */
+    {
+        int wg_q_end = causal_k - 1;
+        if (wg_q_end >= past_len && wg_q_end < k && token_type_ids[ttid_base + wg_q_end] == 1) {
+            int bidir_end = wg_q_end + 1;
+            if (get_sub_group_local_id() == 0) {
+                while (bidir_end < k && token_type_ids[ttid_base + bidir_end] == 1)
+                    bidir_end++;
+            }
+            bidir_end = sub_group_broadcast(bidir_end, 0);
+            causal_k = max(causal_k, bidir_end);
+        }
+    }
     #endif
 #endif
 
@@ -272,6 +292,17 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         int wb = window_k_begin;
         if (get_sub_group_local_id() == 0) {
             while (wb > 0 && token_type_ids[wb - 1] == 1)
+                wb--;
+        }
+        window_k_begin = sub_group_broadcast(wb, 0);
+    }
+    #elif HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION && !IS_GQA_SINGLE_TOKEN
+    /* Same extension for MIXED. The scan stops at past_len because token_type_ids
+       says nothing about tokens cached by earlier chunks. */
+    if (window_k_begin > past_len && token_type_ids[ttid_base + window_k_begin] == 1) {
+        int wb = window_k_begin;
+        if (get_sub_group_local_id() == 0) {
+            while (wb > past_len && token_type_ids[ttid_base + wb - 1] == 1)
                 wb--;
         }
         window_k_begin = sub_group_broadcast(wb, 0);
@@ -1007,6 +1038,40 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
                             const int scan_end = max(offset_q, offset_k);
                             for (int p = scan_begin; p < scan_end; p++) {
                                 if (token_type_ids[p] != 1) {
+                                    is_bidirectional = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!is_bidirectional) {
+                            tile_access(S_tile, i0, j, SUBGROUP_SIZE, ugemm_kq_c_type_block0,
+                                        ugemm_kq_c_type_block1, ugemm_kq_c_type_nblock0) = -FLT_MAX;
+                        }
+                    }
+                }
+            }
+        }
+    #elif HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION && !IS_GQA_SINGLE_TOKEN
+        /* Apply causal mask with bidirectional for image tokens (MIXED).
+           offset_k / offset_q are sequence-global and both are >= past_len for a
+           bidirectional pair, since only chunk-local tokens have a known type. */
+        {
+            const int k_base = k0 + sg_i0_kq;
+            for (int j = 0; j < (ugemm_kq_c_type_block1 * ugemm_kq_c_type_nblock1); j++) {
+                const int offset_k = k_base + j;
+                for (int i0 = 0; i0 < (ugemm_kq_c_type_block0 * ugemm_kq_c_type_nblock0); i0 += SUBGROUP_SIZE) {
+                    int i = i0 + get_sub_group_local_id();
+                    const int offset_q = col_offset + i;
+                    if (greater_than(offset_k, offset_q)) {
+                        bool is_bidirectional = false;
+                        if (offset_k >= past_len && offset_k < k && offset_q < k &&
+                            token_type_ids[ttid_base + offset_k] == 1 &&
+                            token_type_ids[ttid_base + offset_q] == 1) {
+                            is_bidirectional = true;
+                            const int scan_begin = min(offset_q, offset_k) + 1;
+                            const int scan_end = max(offset_q, offset_k);
+                            for (int p = scan_begin; p < scan_end; p++) {
+                                if (token_type_ids[ttid_base + p] != 1) {
                                     is_bidirectional = false;
                                     break;
                                 }

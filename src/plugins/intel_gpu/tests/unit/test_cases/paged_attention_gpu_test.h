@@ -1918,7 +1918,8 @@ public:
 
         if (p.token_type_ids.has_value()) {
             pam.token_type_ids = p.token_type_ids.value();
-            EXPECT_EQ(pam.token_type_ids.size(), static_cast<size_t>(pam.subsequence_descs.back().num_tokens + pam.subsequence_descs.back().past_len));
+            // PA spec: token_type_ids is [B_token], i.e. the scheduled tokens only.
+            EXPECT_EQ(pam.token_type_ids.size(), static_cast<size_t>(pam.subsequence_descs.back().num_tokens));
         }
 
         if (p.has_sink_input && p.sink_values.has_value()) {
