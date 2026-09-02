@@ -1382,11 +1382,27 @@ public:
         return false;
     }
 
-    // MIXED may use micro SDPA regardless of token_type_ids: bidirectional masking is implemented
-    // only in the PREFILL kernels, and in MIXED neither micro SDPA nor paged_attention_opt.cl consumes token_type_ids.
-    // TODO: implement bidirectional attention for MIXED with token_type_ids
+    // Keep the MIXED stage of token_type_ids models on paged_attention_opt.cl.
+    //
+    // #37616 removed this gate because micro SDPA and paged_attention_opt.cl produce the same mask in
+    // MIXED (neither consumes token_type_ids), so the fallback looked like pure overhead - it skipped
+    // the sliding-window shortcut and sized buffers by max_context_len. That overhead is now gone:
+    // paged_attention_opt.cl does the SWA block skip in MULTI_TOKENS as well, and num_of_partitions is
+    // bounded by the window instead of the full context.
+    //
+    // What the equivalence argument did not cover is numerical behaviour. oneDNN micro-kernels are
+    // known to produce inf/nan and run-to-run nondeterminism in the generated systolic ugemm - see the
+    // xe3p workaround in supports_micro_sdpa() below - and concurrency raises MIXED's share of the
+    // decode steps, so the exposure grows exactly where BFCL shows degenerate generation.
+    //
+    // For gemma-4 this covers the 25 sliding-window layers, whose PagedAttention nodes take
+    // token_type_ids from a dynamic Convert; the 5 full-attention layers take a Constant [0] and keep
+    // using micro SDPA.
     bool can_use_micro_sdpa_for(const kernel_impl_params& params, const PagedAttentionStage& stage) const {
-        const auto can_use_micro_sdpa = supports_micro_sdpa(params) && valid_micro_stage(stage);
+        if (!supports_micro_sdpa(params) || !valid_micro_stage(stage))
+            return false;
+        const auto desc = params.typed_desc<paged_attention>();
+        const auto can_use_micro_sdpa = !desc->has_token_type_ids || stage == PagedAttentionStage::PREFILL;
         GPU_DEBUG_TRACE_DETAIL << "can_use_micro_sdpa_for: stage = " << static_cast<size_t>(stage)
                                << ", token_type_ids = " << params.get_input_layout(PagedAttentionInputIdx::TOKEN_TYPE_IDS).to_short_string()
                                << ", can_use_micro_sdpa = " << can_use_micro_sdpa << std::endl;
@@ -1482,13 +1498,22 @@ public:
         rt_params->partition_size = get_partitioning_size(params, desc->v_head_size, rt_params->stage);
 
         auto effective_context_len = rt_params->max_context_len;
-        // scores_output is only used in SnapKV path, and it doesn't yet handle the SWA block skip offset
-        if (desc->sliding_window > 0 && rt_params->stage == PagedAttentionStage::GENERATE && !desc->has_scores_output()) {
-            auto total_blocks = ceil_div(rt_params->max_context_len, paged_attention_block_size);
-            auto swa_start_block =
-                rt_params->max_context_len > desc->sliding_window ? (rt_params->max_context_len - desc->sliding_window) / paged_attention_block_size : 0;
-            auto effective_blocks = total_blocks - swa_start_block;
-            effective_context_len = effective_blocks * paged_attention_block_size;
+        // scores_output is only used in SnapKV path, and it doesn't yet handle the SWA block skip offset.
+        // MIXED is included: paged_attention_opt.cl dispatches one work group per query token there
+        // (global[0] == total_tokens, local[0] == 1), so each work group derives its own window from
+        // its own seq_len exactly as the GENERATE path does.
+        if (desc->sliding_window > 0 && !desc->has_scores_output() &&
+            (rt_params->stage == PagedAttentionStage::GENERATE || rt_params->stage == PagedAttentionStage::MIXED)) {
+            // num_of_partitions is a dispatch dimension shared by every token in the batch, so it must
+            // cover the token that needs the most blocks - which is not necessarily the longest one.
+            // With L = a * B + r and W = c * B + s, the in-window block count is
+            //     blocks(L) = ceil(L/B) - floor((L-W)/B) = c + (r > 0) + (r < s),
+            // which oscillates with the alignment of L and peaks at ceil(W/B) + 1. Evaluating it at
+            // max_context_len can therefore under-count a shorter sequence in the same batch and drop
+            // its last partition, so use the alignment-independent upper bound instead.
+            const auto total_blocks = ceil_div(rt_params->max_context_len, paged_attention_block_size);
+            const auto max_window_blocks = ceil_div(desc->sliding_window, paged_attention_block_size) + 1;
+            effective_context_len = std::min(total_blocks, max_window_blocks) * paged_attention_block_size;
         }
         rt_params->num_of_partitions = ceil_div(effective_context_len, rt_params->partition_size);
 

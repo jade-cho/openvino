@@ -215,9 +215,17 @@ TEST_P(paged_attention_token_type_micro_sdpa_mixed_test, mixed_stage) {
     ASSERT_NE(pa_inst, nullptr);
     auto* impl = pa_inst->get_impl();
     ASSERT_NE(impl, nullptr);
+    // The DPAS/XMX skips above are kept on purpose: the point of this check is that even on a
+    // micro-kernel-capable device, MIXED with token_type_ids stays on paged_attention_opt.cl.
+    // #37616 routed it to micro SDPA because the two kernels mask identically in MIXED and the
+    // fallback was slower; the fallback's cost is now gone (SWA block skip in MULTI_TOKENS), while
+    // the oneDNN micro-kernel inf/nan and run-to-run nondeterminism noted in supports_micro_sdpa()
+    // remain, so the OCL path is the safer default here.
     const auto kernel_entries = impl->get_kernels_dump_info(*pa_inst->get_impl_params()).get_entries();
-    EXPECT_NE(kernel_entries.find("sdpa_micro"), std::string::npos) << "Expected micro SDPA kernel for MIXED with token_type_ids, got: " << kernel_entries;
-    EXPECT_EQ(kernel_entries.find("paged_attention_opt__multi_tokens"), std::string::npos) << "MIXED fell back to the partition kernel: " << kernel_entries;
+    EXPECT_NE(kernel_entries.find("paged_attention_opt__multi_tokens"), std::string::npos)
+        << "Expected the OCL partition kernel for MIXED with token_type_ids, got: " << kernel_entries;
+    EXPECT_EQ(kernel_entries.find("sdpa_micro"), std::string::npos)
+        << "MIXED with token_type_ids selected micro SDPA: " << kernel_entries;
 
     // The golden data covers the whole sequence, but only the scheduled chunk is produced here.
     const size_t hidden_dim = static_cast<size_t>(p.num_heads) * static_cast<size_t>(p.v_head_size);

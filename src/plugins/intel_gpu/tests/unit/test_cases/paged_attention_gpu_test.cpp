@@ -444,6 +444,20 @@ INSTANTIATE_TEST_SUITE_P(smoke_paged_attention, paged_attention_test, ::testing:
     paged_attention_test_params{ {{1008, 692}}, 32, 32, 128, 128, 16, 128, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, PER_TOKEN_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed: prefix caching
     paged_attention_test_params{ {{1008, 792}}, 32, 32, 128, 128, 16, 256, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, PER_TOKEN_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed: prefix caching
     paged_attention_test_params{ {{1, 34}, {2, 20}, {10, 34}}, 2, 2, 64, 64, 16, 10, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, ENABLE_SCORES, PER_TOKEN_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed: 2nd token + 1st token + part of 1st token
+    /* MIXED stage: sliding window x multiple subsequences, on the micro SDPA path.
+       Every pre-existing sliding-window MIXED case either has a single subsequence, or
+       enables scores output - and has_scores_output() disables micro SDPA
+       (paged_attention_opt.cpp::supports_micro_sdpa), so the combination below had no
+       coverage at all. It is what continuous batching with >1 concurrent request hits on a
+       sliding-window model: sdpa_micro.cl derives window_k_begin per work group from that
+       work group's own past_len, so a single-subsequence test cannot catch a mix-up there.
+       DISABLE_SCORES + k_head_size == v_head_size keep these on the micro kernel. */
+    paged_attention_test_params{ {{8, 34}, {1, 100}}, 2, 2, 64, 64, 16, 16, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed + SWA: part of 1st token + 2nd token
+    paged_attention_test_params{ {{4, 20}, {8, 34}, {16, 50}}, 2, 2, 64, 64, 16, 8, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed + SWA: three subsequences, all past_len differ
+    paged_attention_test_params{ {{2, 2000}, {1, 10}}, 2, 2, 64, 64, 16, 64, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed + SWA: past_len >> window for one subsequence, < window for the other
+    paged_attention_test_params{ {{1008, 492}, {1, 600}}, 16, 16, 64, 64, 16, 64, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed + SWA: prefill chunk fused with a decode token (CB shape)
+    paged_attention_test_params{ {{1, 288}, {16, 40}}, 64, 8, 64, 64, 16, 128, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed + SWA, GQA: decode token + prefill chunk
+    paged_attention_test_params{ {{253, 340}, {1, 128}, {1, 512}}, 16, 8, 256, 256, 16, 128, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // mixed + SWA, gemma-4-like shape: prefill chunk + two decode tokens
     /* Per-Block rotation cases with  Per-Channel quantization*/
     paged_attention_test_params{ {{16, 32}}, 2, 2, 32, 32, 16, 0, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, ENABLE_SCORES, PER_BLOCK_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // 2nd token, per block rotate
     paged_attention_test_params{ {{8, 34}}, 2, 2, 64, 64, 16, 0, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, ENABLE_SCORES, PER_BLOCK_ROTATION, DISABLE_FA_V2, false, 0, {}, false }, // 2nd token, per block rotate
