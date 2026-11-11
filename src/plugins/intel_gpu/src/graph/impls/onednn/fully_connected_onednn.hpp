@@ -91,6 +91,16 @@ struct FullyConnectedImplementationManager : public ImplementationManager {
                 if (!is_wei_compressed || !is_zp_compressed) {
                     LOG_AND_RETURN_FALSE(node);
                 }
+            } else if (fc_prim->decompression_zero_point_scalar.has_value()) {
+                // Scalar zp without an input is passed as a host scalar; it must be an integer in the u8/s8 range.
+                const auto zp = fc_prim->decompression_zero_point_scalar.value();
+                // Same weights types as the zp-input case above
+                const bool is_wei_compressed =
+                    one_of(wei_dt,
+                           {ov::element::Type_t::i4, ov::element::Type_t::u4, ov::element::Type_t::u3, ov::element::Type_t::u8, ov::element::Type_t::u2});
+                if (!is_wei_compressed || zp != std::round(zp) || zp < -128.f || zp > 255.f) {
+                    LOG_AND_RETURN_FALSE(node);
+                }
             }
 
             // oneDNN requires every non-unit stride of a sub-byte weights descriptor to hold a whole number of bytes.

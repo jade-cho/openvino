@@ -6231,6 +6231,167 @@ TEST_F(fully_connected_gpu_tests, onednn_acc_test_compressed_weight_int8_group_s
     this->test_comp_weight_scale_zp(false, 64, 256, 2048, 0, 16, 16, WzpMode::Symmetric, WeightMode::Bit8);
 }
 
+namespace {
+enum class HostScalarScale { PerTensor, PerOC, Grouped };
+
+struct onednn_fc_host_scalar_params {
+    data_types weights_dt;    // u8, i8 or u4
+    HostScalarScale scale;    // scale granularity
+    bool scalar_zp;           // single constant zero-point (input kept, value set in decompression_zero_point_scalar)
+    bool scalar_zp_no_input;  // single constant zero-point without an input (value only)
+    bool is_dynamic;
+    bool is_caching_test;
+};
+
+// oneDNN FC with a single-value decompression scale and/or zero-point. These are passed to oneDNN as host scalars
+// (kernel arguments). The result is compared with a CPU reference.
+void test_onednn_fc_host_scalar(const onednn_fc_host_scalar_params& p) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP();
+
+    const int64_t batch = 7, ifm = 256, ofm = 64, group_size = 32;
+    const bool is_u4 = p.weights_dt == data_types::u4;
+    const int64_t scale_groups = p.scale == HostScalarScale::Grouped ? ifm / group_size : 1;
+    const int64_t scale_ofm = p.scale == HostScalarScale::PerTensor ? 1 : ofm;
+    const float zp_value = (p.scalar_zp || p.scalar_zp_no_input) ? (is_u4 ? 8.f : 128.f) : 0.f;
+
+    tests::random_generator rg(GET_SUITE_NAME);
+    auto input_data = rg.generate_random_1d<ov::float16>(batch * ifm, -1.f, 1.f);
+    std::vector<int> w(ofm * ifm);
+    for (auto& v : w)
+        v = p.weights_dt == data_types::i8 ? rg.generate_random_val<int>(-128, 127, 1) : rg.generate_random_val<int>(0, is_u4 ? 15 : 255, 1);
+    std::vector<ov::float16> scale_data(scale_ofm * scale_groups);
+    for (auto& v : scale_data)
+        v = ov::float16(rg.generate_random_val<float>(1.f, 8.f) * (is_u4 ? 0.01f : 0.001f));
+
+    auto input_mem = engine.allocate_memory({ov::PartialShape{batch, ifm}, data_types::f16, format::bfyx});
+    auto weights_mem = engine.allocate_memory({ov::PartialShape{ofm, ifm}, p.weights_dt, format::bfyx});
+    auto scale_mem = engine.allocate_memory({ov::PartialShape{scale_ofm, scale_groups}, data_types::f16, format::bfyx});
+    auto zp_mem = engine.allocate_memory({ov::PartialShape{1, 1}, data_types::u8, format::bfyx});
+    set_values(input_mem, input_data);
+    set_values(scale_mem, scale_data);
+    set_values<uint8_t>(zp_mem, {static_cast<uint8_t>(zp_value)});
+    if (is_u4) {
+        std::vector<uint8_t> packed(ofm * ifm / 2);
+        for (size_t i = 0; i < packed.size(); ++i)
+            packed[i] = static_cast<uint8_t>(w[2 * i] | (w[2 * i + 1] << 4));
+        set_values(weights_mem, packed);
+    } else if (p.weights_dt == data_types::i8) {
+        set_values(weights_mem, std::vector<int8_t>(w.begin(), w.end()));
+    } else {
+        set_values(weights_mem, std::vector<uint8_t>(w.begin(), w.end()));
+    }
+
+    const std::string zp_name = p.scalar_zp ? "zp" : "";
+    auto fc_prim = fully_connected("fc", input_info("input"), "weights", "", "scale", zp_name, data_types::f16, 2, 2);
+    if (p.scalar_zp || p.scalar_zp_no_input)
+        fc_prim.decompression_zero_point_scalar = zp_value;
+    if (p.scale == HostScalarScale::PerTensor)
+        fc_prim.decompression_scale_scalar = static_cast<float>(scale_data[0]);
+
+    auto in_layout = p.is_dynamic ? layout{ov::PartialShape{-1, ifm}, data_types::f16, format::bfyx} : input_mem->get_layout();
+    topology topology(input_layout("input", in_layout), data("weights", weights_mem), data("scale", scale_mem), fc_prim);
+    if (p.scalar_zp)
+        topology.add(data("zp", zp_mem));
+
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_user_property(ov::hint::dynamic_quantization_group_size(0));
+    const ov::intel_gpu::ImplementationDesc impl = {format::bfyx, "", impl_types::onednn};
+    config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"fc", impl}}));
+    auto network = get_network(engine, topology, config, get_test_stream_ptr(), p.is_caching_test);
+    network->set_input_data("input", input_mem);
+    auto output = network->execute().at("fc").get_memory();
+    ASSERT_TRUE(network->get_primitive("fc")->get_impl()->is_onednn());
+
+    mem_lock<ov::float16, mem_lock_type::read> result(output, get_test_stream());
+    ASSERT_EQ(result.size(), static_cast<size_t>(batch * ofm));
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t o = 0; o < ofm; ++o) {
+            float expected = 0.f;
+            for (int64_t k = 0; k < ifm; ++k) {
+                const int64_t s_idx = (scale_ofm == 1 ? 0 : o) * scale_groups + (scale_groups == 1 ? 0 : k / group_size);
+                const float wv = (static_cast<float>(w[o * ifm + k]) - zp_value) * static_cast<float>(scale_data[s_idx]);
+                expected += static_cast<float>(input_data[b * ifm + k]) * wv;
+            }
+            const float actual = static_cast<float>(result[b * ofm + o]);
+            ASSERT_NEAR(expected, actual, 2e-2f + 1e-2f * std::abs(expected)) << "b = " << b << ", o = " << o;
+        }
+    }
+}
+}  // namespace
+
+// u8 weights + scalar zp, per-OC scale: host scalar zp
+TEST(fully_connected_onednn_host_scalar, u8_per_oc_scale_scalar_zp) {
+    test_onednn_fc_host_scalar({data_types::u8, HostScalarScale::PerOC, true, false, false, false});
+}
+// u8 weights + scalar zp + per-tensor scale: host scalar zp and scale
+TEST(fully_connected_onednn_host_scalar, u8_per_tensor_scale_scalar_zp) {
+    test_onednn_fc_host_scalar({data_types::u8, HostScalarScale::PerTensor, true, false, false, false});
+}
+// i8 weights + per-tensor scale, no zp: host scalar scale
+TEST(fully_connected_onednn_host_scalar, i8_per_tensor_scale) {
+    test_onednn_fc_host_scalar({data_types::i8, HostScalarScale::PerTensor, false, false, false, false});
+}
+// u4 weights + grouped scale + scalar zp: host scalar zp
+TEST(fully_connected_onednn_host_scalar, u4_grouped_scale_scalar_zp) {
+    test_onednn_fc_host_scalar({data_types::u4, HostScalarScale::Grouped, true, false, false, false});
+}
+// Scalar zp given only as a value (no zp input)
+TEST(fully_connected_onednn_host_scalar, u4_grouped_scale_scalar_zp_no_input) {
+    test_onednn_fc_host_scalar({data_types::u4, HostScalarScale::Grouped, false, true, false, false});
+}
+TEST(fully_connected_onednn_host_scalar, u8_per_tensor_scale_scalar_zp_dynamic) {
+    test_onednn_fc_host_scalar({data_types::u8, HostScalarScale::PerTensor, true, false, true, false});
+}
+TEST(fully_connected_onednn_host_scalar, u4_grouped_scale_scalar_zp_dynamic) {
+    test_onednn_fc_host_scalar({data_types::u4, HostScalarScale::Grouped, true, false, true, false});
+}
+TEST(fully_connected_onednn_host_scalar, u8_per_tensor_scale_scalar_zp_cached) {
+    test_onednn_fc_host_scalar({data_types::u8, HostScalarScale::PerTensor, true, false, false, true});
+}
+TEST(fully_connected_onednn_host_scalar, u4_grouped_scale_scalar_zp_cached) {
+    test_onednn_fc_host_scalar({data_types::u4, HostScalarScale::Grouped, true, false, false, true});
+}
+TEST(fully_connected_onednn_host_scalar, u4_grouped_scale_scalar_zp_no_input_cached) {
+    test_onednn_fc_host_scalar({data_types::u4, HostScalarScale::Grouped, false, true, true, true});
+}
+
+// A non-integer scalar zp without an input can't be a oneDNN host zero-point, so oneDNN must not be selected.
+TEST(fully_connected_onednn_host_scalar, non_integer_scalar_zp_no_input_not_onednn) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP();
+
+    const int64_t batch = 2, ifm = 64, ofm = 16;
+    auto input_mem = engine.allocate_memory({ov::PartialShape{batch, ifm}, data_types::f16, format::bfyx});
+    auto weights_mem = engine.allocate_memory({ov::PartialShape{ofm, ifm}, data_types::u8, format::bfyx});
+    auto scale_mem = engine.allocate_memory({ov::PartialShape{ofm, 1}, data_types::f16, format::bfyx});
+    set_values(input_mem, std::vector<ov::float16>(batch * ifm, ov::float16(1.f)));
+    set_values(weights_mem, std::vector<uint8_t>(ofm * ifm, 10));
+    set_values(scale_mem, std::vector<ov::float16>(ofm, ov::float16(0.5f)));
+
+    auto fc_prim = fully_connected("fc", input_info("input"), "weights", "", "scale", "", data_types::f16, 2, 2);
+    fc_prim.decompression_zero_point_scalar = 7.5f;
+    topology topology(input_layout("input", input_mem->get_layout()), data("weights", weights_mem), data("scale", scale_mem), fc_prim);
+
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    network network(engine, topology, config);
+    network.set_input_data("input", input_mem);
+    auto output = network.execute().at("fc").get_memory();
+    ASSERT_FALSE(network.get_primitive("fc")->get_impl()->is_onednn());
+
+    mem_lock<ov::float16, mem_lock_type::read> result(output, get_test_stream());
+    const float expected = static_cast<float>(ifm) * (10.f - 7.5f) * 0.5f;
+    for (size_t i = 0; i < result.size(); ++i) {
+        ASSERT_FLOAT_EQ(expected, static_cast<float>(result[i])) << "i = " << i;
+    }
+}
+
 using fully_connected_dynamic_test_params = std::tuple<
     std::vector<ov::Dimension::value_type>, // batch_sizes
     ov::Dimension::value_type,              // input_f

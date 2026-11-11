@@ -29,6 +29,30 @@ private:
     int _ds_group_size;
     dnnl::memory::data_type _ds_data_type;
     dnnl::memory::data_type _dzp_data_type;
+    // Single-value weights decompression scale / zero-point passed as oneDNN host scalars
+    // (kernel arguments) instead of 1-element device buffers.
+    bool _ds_host_scalar = false;
+    bool _dzp_host_scalar = false;
+
+    static bool can_use_host_scalar_scale(const fully_connected& prim, const layout& scale_layout, dnnl::memory::data_type dt) {
+        return prim.decompression_scale_scalar.has_value() && scale_layout.count() == 1 &&
+               one_of(dt, {dnnl::memory::data_type::f16, dnnl::memory::data_type::f32, dnnl::memory::data_type::bf16});
+    }
+
+    static bool can_use_host_scalar_zp(const fully_connected& prim, const layout* zp_layout, dnnl::memory::data_type dt) {
+        return prim.decompression_zero_point_scalar.has_value() && (zp_layout == nullptr || zp_layout->count() == 1) &&
+               one_of(dt, {dnnl::memory::data_type::u8, dnnl::memory::data_type::s8, dnnl::memory::data_type::s32});
+    }
+
+    // Data type of a scalar zero-point that has no input: follow the weights signedness (as ConvertFullyConnectedToFullyConnectedCompressed
+    // does for the zp constant) if the value fits, otherwise use the other 8-bit type.
+    static dnnl::memory::data_type scalar_zp_data_type(const layout& weights_layout, float zp) {
+        const bool fits_u8 = zp >= 0.f && zp <= 255.f;
+        const bool fits_s8 = zp >= -128.f && zp <= 127.f;
+        if (ov::element::Type(weights_layout.data_type).is_signed())
+            return fits_s8 ? dnnl::memory::data_type::s8 : dnnl::memory::data_type::u8;
+        return fits_u8 ? dnnl::memory::data_type::u8 : dnnl::memory::data_type::s8;
+    }
 
 protected:
     std::unique_ptr<primitive_impl> clone() const override {
@@ -58,12 +82,21 @@ protected:
 
             if (prim->decompression_scale.is_valid()) {
                 auto decompression_scale_idx = idx++;
-                auto scale_mem = instance.dep_memory_ptr(decompression_scale_idx);
-                dnnl::memory::desc desc = onednn::layout_to_memory_desc_flatten(scale_mem->get_layout(), dnnl::memory::format_tag::a);
-                args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scale_mem->get_onednn_memory(desc)});
+                if (_ds_host_scalar) {
+                    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, onednn::make_host_scalar(_ds_data_type, prim->decompression_scale_scalar.value())});
+                } else {
+                    auto scale_mem = instance.dep_memory_ptr(decompression_scale_idx);
+                    dnnl::memory::desc desc = onednn::layout_to_memory_desc_flatten(scale_mem->get_layout(), dnnl::memory::format_tag::a);
+                    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scale_mem->get_onednn_memory(desc)});
+                }
             }
 
-            if (prim->decompression_zero_point.is_valid()) {
+            if (_dzp_host_scalar) {
+                if (prim->decompression_zero_point.is_valid())
+                    idx++;
+                args.insert(
+                    {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, onednn::make_host_scalar(_dzp_data_type, prim->decompression_zero_point_scalar.value())});
+            } else if (prim->decompression_zero_point.is_valid()) {
                 auto decompression_zp_idx = idx++;
                 auto zp_mem = instance.dep_memory_ptr(decompression_zp_idx);
                 dnnl::memory::desc desc = onednn::layout_to_memory_desc_flatten(zp_mem->get_layout(), dnnl::memory::format_tag::a);
@@ -232,11 +265,13 @@ public:
         if (has_decompression_scale) {
             ob << _ds_group_size;
             ob << make_data(&_ds_data_type, sizeof(dnnl::memory::data_type));
+            ob << _ds_host_scalar;
         }
 
         bool has_decompression_zp = prim->decompression_zero_point.is_valid() || prim->decompression_zero_point_scalar.has_value();
         if (has_decompression_zp) {
             ob << make_data(&_dzp_data_type, sizeof(dnnl::memory::data_type));
+            ob << _dzp_host_scalar;
         }
 
         ob << get_cache_blob();
@@ -281,12 +316,15 @@ public:
         if (has_decompression_scale) {
             ib >> _ds_group_size;
             ib >> make_data(&_ds_data_type, sizeof(dnnl::memory::data_type));
+            ib >> _ds_host_scalar;
 
             auto decompression_scale_idx = ++idx;
             auto scale_layout = arg.get_dependency(decompression_scale_idx).get_output_layout();
             const auto weights_layout_for_scale = arg.get_dependency(1).get_output_layout();
             const auto ngroups = get_ngroups(weights_layout_for_scale, scale_layout, prim->weights_transposed);
-            if (scale_layout.count() == 1) {
+            if (_ds_host_scalar) {
+                _attrs->set_host_scale(DNNL_ARG_WEIGHTS, _ds_data_type);
+            } else if (scale_layout.count() == 1) {
                 _attrs->set_scales(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, _ds_data_type);
             } else if (ngroups == 1 && !has_batch_dim) {
                 _attrs->set_scales(DNNL_ARG_WEIGHTS, per_oc, dnnl::memory::dims{}, _ds_data_type);
@@ -298,7 +336,12 @@ public:
         bool has_decompression_zp = prim->decompression_zero_point.is_valid() || prim->decompression_zero_point_scalar.has_value();
         if (has_decompression_zp) {
             ib >> make_data(&_dzp_data_type, sizeof(dnnl::memory::data_type));
-            if (prim->decompression_zero_point.is_valid()) {
+            ib >> _dzp_host_scalar;
+            if (_dzp_host_scalar) {
+                if (prim->decompression_zero_point.is_valid())
+                    ++idx;
+                _attrs->set_host_zero_point(DNNL_ARG_WEIGHTS, _dzp_data_type);
+            } else if (prim->decompression_zero_point.is_valid()) {
                 auto decompression_zp_idx = ++idx;
                 auto dzp_layout = arg.get_dependency(decompression_zp_idx).get_output_layout();
 
@@ -314,8 +357,7 @@ public:
                     }
                 }
             }
-            // Note: scalar ZP (decompression_zero_point_scalar) requires no dependency node,
-            // so skip get_dependency(). The scalar value is used during inference directly.
+            // Note: scalar ZP (decompression_zero_point_scalar) without a dependency node is always passed as a host scalar.
         }
 
         const auto input_dt = impl_params->get_input_layout(0).data_type;
@@ -363,6 +405,8 @@ public:
         int group_size = 0;
         dnnl::memory::data_type ds_data_type = dnnl::memory::data_type::undef;
         dnnl::memory::data_type dzp_data_type = dnnl::memory::data_type::undef;
+        bool ds_host_scalar = false;
+        bool dzp_host_scalar = false;
         int idx = !arg.bias_term() ? 1 : 2;
 
         if (prim->compressed_weights) {
@@ -390,7 +434,10 @@ public:
                 group_size = static_cast<int>(scale_group_size);
                 OPENVINO_ASSERT(is_supported_scale_group(ngroups, group_size),
                     "[GPU] group_size should be aligned to 16 if it is not a single scale group or the group_size is not one.");
-                if (scale_layout.count() == 1) {
+                if (can_use_host_scalar_scale(*prim, scale_layout, ds_data_type)) {
+                    ds_host_scalar = true;
+                    attr->set_host_scale(DNNL_ARG_WEIGHTS, ds_data_type);
+                } else if (scale_layout.count() == 1) {
                     attr->set_scales(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, ds_data_type);
                 } else if (ngroups == 1 && !has_batch_dim) {
                     attr->set_scales(DNNL_ARG_WEIGHTS, per_oc, dnnl::memory::dims{}, ds_data_type);
@@ -408,7 +455,10 @@ public:
                 auto dzp_layout = arg.get_dependency(decompression_zp_idx).get_output_layout();
                 dzp_data_type = convert_data_type(dzp_layout.data_type);
 
-                if (dzp_layout.count() == 1) {
+                if (can_use_host_scalar_zp(*prim, &dzp_layout, dzp_data_type)) {
+                    dzp_host_scalar = true;
+                    attr->set_host_zero_point(DNNL_ARG_WEIGHTS, dzp_data_type);
+                } else if (dzp_layout.count() == 1) {
                     attr->set_zero_points(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, dzp_data_type);
                 } else {
                     auto dzp_shape = dzp_layout.get_partial_shape();
@@ -423,6 +473,12 @@ public:
                         attr->set_zero_points(DNNL_ARG_WEIGHTS, grouped, {group_size, 1}, dzp_data_type);
                     }
                 }
+            } else if (prim->decompression_zero_point_scalar.has_value()) {
+                // Scalar zero-point without an input: it can only be passed as a host scalar
+                dzp_data_type = scalar_zp_data_type(weights_layout, prim->decompression_zero_point_scalar.value());
+                OPENVINO_ASSERT(can_use_host_scalar_zp(*prim, nullptr, dzp_data_type), "[GPU] Unsupported scalar zero-point for oneDNN FC ", arg.id());
+                dzp_host_scalar = true;
+                attr->set_host_zero_point(DNNL_ARG_WEIGHTS, dzp_data_type);
             }
 
             if (is_dyn_quan_input && prim->dynamic_quantized_activation) {
@@ -449,14 +505,40 @@ public:
                 }
             }
 
-
-            auto prim_desc = get_matmul_primitive_descriptor(impl_params, impl_params.prog->get_engine(),
-                                                             prim->input_size, prim->weights_rank, prim->bias.is_valid(), *attr);
+            std::shared_ptr<dnnl::matmul::primitive_desc> prim_desc;
+            try {
+                prim_desc = get_matmul_primitive_descriptor(impl_params,
+                                                            impl_params.prog->get_engine(),
+                                                            prim->input_size,
+                                                            prim->weights_rank,
+                                                            prim->bias.is_valid(),
+                                                            *attr);
+            } catch (const dnnl::error&) {
+                // Fall back to 1-element device buffers if no oneDNN kernel supports host scalars for this case
+                const bool can_fallback_zp = !dzp_host_scalar || prim->decompression_zero_point.is_valid();
+                if (!(ds_host_scalar || dzp_host_scalar) || !can_fallback_zp)
+                    throw;
+                GPU_DEBUG_TRACE_DETAIL << arg.id() << ": oneDNN FC doesn't support host scalar scale/zp, use device buffers" << std::endl;
+                if (ds_host_scalar)
+                    attr->set_scales(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, ds_data_type);
+                if (dzp_host_scalar)
+                    attr->set_zero_points(DNNL_ARG_WEIGHTS, COMMON, dnnl::memory::dims{}, dzp_data_type);
+                ds_host_scalar = false;
+                dzp_host_scalar = false;
+                prim_desc = get_matmul_primitive_descriptor(impl_params,
+                                                            impl_params.prog->get_engine(),
+                                                            prim->input_size,
+                                                            prim->weights_rank,
+                                                            prim->bias.is_valid(),
+                                                            *attr);
+            }
 
             auto prim_onednn = std::make_unique<fully_connected_onednn>(engine, config, attr, *prim_desc);
             prim_onednn->_ds_group_size = group_size;
             prim_onednn->_ds_data_type = ds_data_type;
             prim_onednn->_dzp_data_type = dzp_data_type;
+            prim_onednn->_ds_host_scalar = ds_host_scalar;
+            prim_onednn->_dzp_host_scalar = dzp_host_scalar;
             return prim_onednn;
         }
         auto prim_desc =

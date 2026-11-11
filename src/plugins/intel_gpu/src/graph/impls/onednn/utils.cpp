@@ -7,7 +7,11 @@
 #include <oneapi/dnnl/dnnl_debug.h>
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
+
+#include "openvino/core/type/bfloat16.hpp"
+#include "openvino/core/type/float16.hpp"
 
 namespace cldnn {
 namespace onednn {
@@ -84,6 +88,27 @@ cldnn::memory::ptr convert_zp_data_to_s32(const memory::ptr zp_memory) {
     }
 
     return zp_s32_memory;
+}
+
+dnnl::memory make_host_scalar(dnnl::memory::data_type dt, float value) {
+    using dnnl_dt = dnnl::memory::data_type;
+    const auto md = dnnl::memory::desc::host_scalar(dt);
+    switch (dt) {
+    case dnnl_dt::f32:
+        return dnnl::memory(md, value);
+    case dnnl_dt::f16:
+        return dnnl::memory(md, ov::float16(value));
+    case dnnl_dt::bf16:
+        return dnnl::memory(md, ov::bfloat16(value));
+    case dnnl_dt::s32:
+        return dnnl::memory(md, static_cast<int32_t>(std::lround(value)));
+    case dnnl_dt::s8:
+        return dnnl::memory(md, static_cast<int8_t>(std::lround(value)));
+    case dnnl_dt::u8:
+        return dnnl::memory(md, static_cast<uint8_t>(std::lround(value)));
+    default:
+        OPENVINO_THROW("[GPU] Unsupported oneDNN host scalar data type: ", static_cast<int>(dt));
+    }
 }
 
 cldnn::format default_fmt_for_dims(size_t dims, bool is_grouped) {

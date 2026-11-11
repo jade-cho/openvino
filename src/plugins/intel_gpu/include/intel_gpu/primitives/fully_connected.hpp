@@ -181,6 +181,9 @@ struct fully_connected : public primitive_base<fully_connected> {
     input_info activation_zero_point = {"", 0};
     input_info activation_precomputed_reduction = {"", 0};
     std::optional<float> decompression_zero_point_scalar;
+    /// @brief Value of a single (per-tensor) constant decompression scale, if known at compile time.
+    /// decompression_scale input is kept for the implementations that read it from memory.
+    std::optional<float> decompression_scale_scalar;
 
     /// @brief Input pre-transform: blockwise normalised Walsh-Hadamard of size
     /// hadamard_block along K, after an optional per-element sign flip. Set by
@@ -215,6 +218,8 @@ struct fully_connected : public primitive_base<fully_connected> {
         seed = hash_combine(seed, activation_precomputed_reduction.is_valid());
         seed = hash_combine(seed, decompression_zero_point_scalar.has_value());
         seed = hash_combine(seed, decompression_zero_point_scalar.value_or(0.0f));
+        seed = hash_combine(seed, decompression_scale_scalar.has_value());
+        seed = hash_combine(seed, decompression_scale_scalar.value_or(0.0f));
         seed = hash_combine(seed, hadamard_block);
         seed = hash_combine(seed, hadamard_signs.size());
         return seed;
@@ -226,6 +231,8 @@ struct fully_connected : public primitive_base<fully_connected> {
         }
 
         auto rhs_casted = downcast<const fully_connected>(rhs);
+        if (decompression_scale_scalar != rhs_casted.decompression_scale_scalar)
+            return false;
 
         return input_size == rhs_casted.input_size &&
                weights_rank == rhs_casted.weights_rank &&
@@ -269,6 +276,11 @@ struct fully_connected : public primitive_base<fully_connected> {
         } else {
             ob << false;
         }
+        ob << decompression_scale_scalar.has_value();
+        if (decompression_scale_scalar.has_value()) {
+            float decompression_scale_value = decompression_scale_scalar.value();
+            ob << decompression_scale_value;
+        }
         ob << hadamard_block;
         ob << hadamard_signs;
     }
@@ -300,6 +312,15 @@ struct fully_connected : public primitive_base<fully_connected> {
             decompression_zero_point_scalar = decompression_zero_point_value;
         } else {
             decompression_zero_point_scalar = std::optional<float>();
+        }
+        bool has_scale_value = false;
+        ib >> has_scale_value;
+        if (has_scale_value) {
+            float decompression_scale_value = 0.f;
+            ib >> decompression_scale_value;
+            decompression_scale_scalar = decompression_scale_value;
+        } else {
+            decompression_scale_scalar = std::optional<float>();
         }
         ib >> hadamard_block;
         ib >> hadamard_signs;

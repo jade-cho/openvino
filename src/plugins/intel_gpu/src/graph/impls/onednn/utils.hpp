@@ -86,6 +86,10 @@ size_t get_post_ops_count(const program_node& node);
 bool is_supported_post_ops(const program_node& node);
 bool is_supported_pad(const layout& layout);
 
+// Creates a oneDNN host-side scalar memory of data type `dt` that holds `value`.
+// Supported types: f32, f16, bf16, s32, s8, u8 (the types oneDNN accepts for host scalar scales/zero-points).
+dnnl::memory make_host_scalar(dnnl::memory::data_type dt, float value);
+
 // Check if data node is per-tensor
 template <typename T>
 bool is_per_tensor(cldnn::data_node& node, int32_t& zp_val);

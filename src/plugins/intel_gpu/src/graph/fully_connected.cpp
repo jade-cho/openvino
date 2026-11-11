@@ -382,6 +382,9 @@ std::string fully_connected_inst::to_string(fully_connected_node const& node) {
         if (desc->decompression_zero_point_scalar.has_value()) {
             fc_info.add("decompression zp value", desc->decompression_zero_point_scalar.value());
         }
+        if (desc->decompression_scale_scalar.has_value()) {
+            fc_info.add("decompression scale value", desc->decompression_scale_scalar.value());
+        }
     }
     if (desc->dynamic_quantized_activation) {
         fc_info.add("activation scale id", desc->activation_scale.pid);

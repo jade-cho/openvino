@@ -44,11 +44,16 @@ static void CreateFullyConnectedCompressedOp(ProgramBuilder& p, const std::share
 
     float zp_value = 0.0f;
     bool has_scalar_zp = false;
+    // The scalar zp input can be dropped and passed only as a value. On immad this is limited to u8/i8 zero-points,
+    // which oneDNN takes as a host scalar; other types keep the input so the implementation selection doesn't change.
+    bool drop_scalar_zp_input = false;
     if (!zp_name.empty()) {
         auto zp_const = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(W_ZP_IDX));
         if (zp_const && ov::shape_size(zp_const->get_output_shape(0)) == 1) {
             has_scalar_zp = true;
             zp_value = zp_const->cast_vector<float>()[0];
+            const auto zp_type = zp_const->get_element_type();
+            drop_scalar_zp_input = !supports_immad || zp_type == ov::element::u8 || zp_type == ov::element::i8;
         }
     }
 
@@ -57,7 +62,7 @@ static void CreateFullyConnectedCompressedOp(ProgramBuilder& p, const std::share
                                      weights_name,
                                      bias_name,
                                      scale_name,
-                                     has_scalar_zp && !supports_immad ? "" : zp_name,
+                                     drop_scalar_zp_input ? "" : zp_name,
                                      activation_scale_input,
                                      activation_zero_point_input,
                                      activation_precomputed_reduction,
@@ -70,6 +75,13 @@ static void CreateFullyConnectedCompressedOp(ProgramBuilder& p, const std::share
 
     if (has_scalar_zp) {
         fc.decompression_zero_point_scalar = zp_value;
+    }
+
+    // A single constant scale can be passed to oneDNN as a host scalar
+    if (auto scale_const = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(3))) {
+        if (ov::shape_size(scale_const->get_output_shape(0)) == 1) {
+            fc.decompression_scale_scalar = scale_const->cast_vector<float>()[0];
+        }
     }
 
     // Input rotation absorbed by FuseHadamardIntoFC.

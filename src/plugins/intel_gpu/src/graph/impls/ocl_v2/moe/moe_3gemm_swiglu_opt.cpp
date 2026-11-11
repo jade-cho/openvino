@@ -636,8 +636,8 @@ static dnnl::memory make_host_scalar_zp(const memory::ptr& zp_mem, cldnn::stream
     const auto dt = zp_mem->get_layout().data_type;
     OPENVINO_ASSERT(one_of(dt, {data_types::u8, data_types::i8}), "moe_3gemm: unsupported host scalar zero point type ", dt);
     cldnn::mem_lock<uint8_t, mem_lock_type::read> lock(zp_mem, stream);
-    const auto md = dnnl::memory::desc::host_scalar(convert_data_type(dt));
-    return dt == data_types::u8 ? dnnl::memory(md, lock[0]) : dnnl::memory(md, static_cast<int8_t>(lock[0]));
+    const float value = dt == data_types::u8 ? static_cast<float>(lock[0]) : static_cast<float>(static_cast<int8_t>(lock[0]));
+    return cldnn::onednn::make_host_scalar(convert_data_type(dt), value);
 }
 
 class moe_3gemm_swiglu_opt_impl : public PrimitiveImplOCL {
