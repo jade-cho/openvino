@@ -207,6 +207,10 @@ struct convolution : public primitive_base<convolution> {
     input_info activations_zero_points;
     /// @brief Primitive id containing compensation.
     input_info compensation;
+    /// @brief Value of the activations / weights zero-points if all elements are equal (per-tensor) and known at compile time.
+    /// The zero-point inputs are kept for the implementations that read them from memory.
+    std::optional<int32_t> activations_zero_point_scalar;
+    std::optional<int32_t> weights_zero_point_scalar;
 
     size_t hash() const override {
         size_t seed = primitive::hash();
@@ -227,6 +231,10 @@ struct convolution : public primitive_base<convolution> {
         seed = hash_combine(seed, !weights_zero_points.is_valid());
         seed = hash_combine(seed, !activations_zero_points.is_valid());
         seed = hash_combine(seed, !compensation.is_valid());
+        seed = hash_combine(seed, activations_zero_point_scalar.has_value());
+        seed = hash_combine(seed, activations_zero_point_scalar.value_or(0));
+        seed = hash_combine(seed, weights_zero_point_scalar.has_value());
+        seed = hash_combine(seed, weights_zero_point_scalar.value_or(0));
         return seed;
     }
 
@@ -236,6 +244,8 @@ struct convolution : public primitive_base<convolution> {
         }
 
         auto rhs_casted = downcast<const convolution>(rhs);
+        if (activations_zero_point_scalar != rhs_casted.activations_zero_point_scalar || weights_zero_point_scalar != rhs_casted.weights_zero_point_scalar)
+            return false;
 
         #define cmp_fields(name) name == rhs_casted.name
         return cmp_fields(stride) &&
@@ -277,6 +287,12 @@ struct convolution : public primitive_base<convolution> {
         ob << weights_zero_points;
         ob << activations_zero_points;
         ob << compensation;
+        ob << activations_zero_point_scalar.has_value();
+        if (activations_zero_point_scalar.has_value())
+            ob << activations_zero_point_scalar.value();
+        ob << weights_zero_point_scalar.has_value();
+        if (weights_zero_point_scalar.has_value())
+            ob << weights_zero_point_scalar.value();
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -298,6 +314,18 @@ struct convolution : public primitive_base<convolution> {
         ib >> weights_zero_points;
         ib >> activations_zero_points;
         ib >> compensation;
+        auto load_optional = [&ib](std::optional<int32_t>& v) {
+            bool has_value = false;
+            ib >> has_value;
+            v.reset();
+            if (has_value) {
+                int32_t value = 0;
+                ib >> value;
+                v = value;
+            }
+        };
+        load_optional(activations_zero_point_scalar);
+        load_optional(weights_zero_point_scalar);
     }
 
 protected:

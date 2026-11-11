@@ -148,6 +148,10 @@ struct convolution_onednn : typed_primitive_onednn_impl<convolution> {
 private:
     int _zero_point_mask;
     dnnl::memory::data_type _wzp_data_type = dnnl::memory::data_type::undef;
+    // Per-tensor activations / weights zero-points passed as oneDNN host scalars (kernel arguments) instead of device buffers.
+    // The values come from the primitive (activations_zero_point_scalar / weights_zero_point_scalar) of the executed instance.
+    bool _azp_host_scalar = false;
+    bool _wzp_host_scalar = false;
 
 protected:
     std::unique_ptr<primitive_impl> clone() const override {
@@ -169,7 +173,11 @@ protected:
             args.insert({DNNL_ARG_BIAS, bias->get_onednn_memory(_pd.weights_desc(1), offset)});
         }
 
-        if (instance.activations_zero_points_term()) {
+        const auto& desc = instance.get_typed_desc<convolution>();
+        if (_azp_host_scalar) {
+            args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC,
+                         onednn::make_host_scalar(dnnl::memory::data_type::s32, static_cast<float>(desc->activations_zero_point_scalar.value()))});
+        } else if (instance.activations_zero_points_term()) {
             auto a_zp = instance.activations_zero_points_memory();
 
             // In the case of dynamic model, if choose_impl was executed in runtime,
@@ -187,7 +195,10 @@ protected:
                 << " " << a_zp->get_layout().to_short_string() << std::endl;
         }
 
-        if (instance.weights_zero_points_term()) {
+        if (_wzp_host_scalar) {
+            args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
+                         onednn::make_host_scalar(_wzp_data_type, static_cast<float>(desc->weights_zero_point_scalar.value()))});
+        } else if (instance.weights_zero_points_term()) {
             auto w_zp = instance.weights_zero_points_memory();
             dnnl::memory::desc desc = onednn::layout_to_memory_desc_flatten(w_zp->get_layout(), dnnl::memory::format_tag::a);
             args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, w_zp->get_onednn_memory(desc)});
@@ -207,6 +218,10 @@ protected:
         _wzp_data_type = data_type;
     }
 
+    static bool can_use_host_scalar_wzp(dnnl::memory::data_type dt) {
+        return one_of(dt, {dnnl::memory::data_type::u8, dnnl::memory::data_type::s8, dnnl::memory::data_type::s32});
+    }
+
     template <typename T>
     static void set_activation_zero_points_attr(const std::shared_ptr<dnnl::primitive_attr>& attrs,
                                                 cldnn::data_node& node, int& zero_point_mask) {
@@ -219,10 +234,13 @@ protected:
     }
 
     static std::shared_ptr<dnnl::primitive_attr> get_primitive_attributes(const typed_program_node<convolution>& arg,
-                                                                            const kernel_impl_params& impl_params,
-                                                                            int& zero_point_mask,
-                                                                            dnnl::memory::data_type& wzp_data_type) {
+                                                                          const kernel_impl_params& impl_params,
+                                                                          int& zero_point_mask,
+                                                                          dnnl::memory::data_type& wzp_data_type,
+                                                                          bool& azp_host_scalar,
+                                                                          bool& wzp_host_scalar) {
         auto attrs = impl_params.attrs_onednn;
+        const auto prim = impl_params.typed_desc<convolution>();
 
         // accumulation_mode::any allows oneDNN to use f16 as the accumulation type.
         if ((impl_params.get_input_layout(0).data_type == data_types::f16) &&
@@ -245,13 +263,22 @@ protected:
             } else if (a_zp_dtype == data_types::i32) {
                 set_activation_zero_points_attr<ov::element_type_traits<data_types::i32>::value_type>(attrs, a_zp.as<data>(), zero_point_mask);
             }
+
+            // A per-tensor zero-point known at compile time is passed as a host scalar
+            if (zero_point_mask == 0 && prim->activations_zero_point_scalar.has_value()) {
+                azp_host_scalar = true;
+                attrs->set_host_zero_point(DNNL_ARG_SRC, dnnl::memory::data_type::s32);
+            }
         }
 
         if (arg.weights_zero_points_term()) {
             auto& wzp = arg.weights_zero_points();
             auto wzp_layout = wzp.get_output_layout();
             wzp_data_type = convert_data_type(wzp_layout.data_type);
-            if (wzp_layout.count() == 1) {
+            if (wzp_layout.count() == 1 && prim->weights_zero_point_scalar.has_value() && can_use_host_scalar_wzp(wzp_data_type)) {
+                wzp_host_scalar = true;
+                attrs->set_host_zero_point(DNNL_ARG_WEIGHTS, wzp_data_type);
+            } else if (wzp_layout.count() == 1) {
                 attrs->set_zero_points(DNNL_ARG_WEIGHTS, 0, dnnl::memory::dims{}, wzp_data_type);
             } else {
                 throw std::runtime_error("Convolution oneDNN primitive doesn't support PER_OC weights zero points");
@@ -293,6 +320,8 @@ public:
         parent::save(ob);
 
         ob << _zero_point_mask;
+        ob << _azp_host_scalar;
+        ob << _wzp_host_scalar;
 
         const dnnl::convolution_forward::primitive_desc *typed_pd
             = reinterpret_cast<const dnnl::convolution_forward::primitive_desc *>(&_pd);
@@ -319,7 +348,11 @@ public:
         parent::load(ib);
 
         ib >> _zero_point_mask;
-        if (_zero_point_mask != -1) {
+        ib >> _azp_host_scalar;
+        ib >> _wzp_host_scalar;
+        if (_azp_host_scalar) {
+            _attrs->set_host_zero_point(DNNL_ARG_SRC, dnnl::memory::data_type::s32);
+        } else if (_zero_point_mask != -1) {
             _attrs->set_zero_points_mask(DNNL_ARG_SRC, _zero_point_mask);
         }
 
@@ -353,7 +386,11 @@ public:
         bool has_wzp = prim->weights_zero_points.is_valid();
         if (has_wzp) {
             ib >> make_data(&_wzp_data_type, sizeof(dnnl::memory::data_type));
-            _attrs->set_zero_points(DNNL_ARG_WEIGHTS, 0, dnnl::memory::dims{}, _wzp_data_type);
+            if (_wzp_host_scalar) {
+                _attrs->set_host_zero_point(DNNL_ARG_WEIGHTS, _wzp_data_type);
+            } else {
+                _attrs->set_zero_points(DNNL_ARG_WEIGHTS, 0, dnnl::memory::dims{}, _wzp_data_type);
+            }
         }
 
         if (zero_bias) {
@@ -389,16 +426,35 @@ public:
         const auto& config = impl_params.prog->get_config();
         int zero_point_mask = -1;
         dnnl::memory::data_type wzp_data_type = dnnl::memory::data_type::undef;
+        bool azp_host_scalar = false;
+        bool wzp_host_scalar = false;
 
-        auto attr = get_primitive_attributes(arg, impl_params, zero_point_mask, wzp_data_type);
+        auto attr = get_primitive_attributes(arg, impl_params, zero_point_mask, wzp_data_type, azp_host_scalar, wzp_host_scalar);
 
-        auto prim_desc = get_convolution_primitive_descriptor(impl_params, *attr);
+        std::shared_ptr<dnnl::convolution_forward::primitive_desc> prim_desc;
+        try {
+            prim_desc = get_convolution_primitive_descriptor(impl_params, *attr);
+        } catch (const dnnl::error&) {
+            // Fall back to device buffers if no oneDNN kernel supports host scalar zero-points for this case
+            if (!azp_host_scalar && !wzp_host_scalar)
+                throw;
+            GPU_DEBUG_TRACE_DETAIL << arg.id() << ": oneDNN convolution doesn't support host scalar zero-points, use device buffers" << std::endl;
+            if (azp_host_scalar)
+                attr->set_zero_points_mask(DNNL_ARG_SRC, zero_point_mask);
+            if (wzp_host_scalar)
+                attr->set_zero_points(DNNL_ARG_WEIGHTS, 0, dnnl::memory::dims{}, wzp_data_type);
+            azp_host_scalar = false;
+            wzp_host_scalar = false;
+            prim_desc = get_convolution_primitive_descriptor(impl_params, *attr);
+        }
 
         auto conv_onednn_impl = std::make_unique<convolution_onednn>(engine, config, attr, *prim_desc,
                                                 get_weights_reorder(impl_params, *prim_desc, arg.get_transposed()));
 
         conv_onednn_impl->set_zero_point_mask(zero_point_mask);
         conv_onednn_impl->set_weights_zero_point_data_type(wzp_data_type);
+        conv_onednn_impl->_azp_host_scalar = azp_host_scalar;
+        conv_onednn_impl->_wzp_host_scalar = wzp_host_scalar;
 
         return conv_onednn_impl;
     }

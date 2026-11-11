@@ -459,6 +459,8 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
 
             // Copy transposed flag to new prim as convolution node might be produced by deconv -> conv replacement before this pass
             conv_with_bias_prim->transposed = desc->transposed;
+            conv_with_bias_prim->activations_zero_point_scalar = desc->activations_zero_point_scalar;
+            conv_with_bias_prim->weights_zero_point_scalar = desc->weights_zero_point_scalar;
             auto& new_conv_node = p.get_or_create(conv_with_bias_prim);
 
             fuse_bias_f(conv, new_conv_node, bias_node, eltw_node);

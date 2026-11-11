@@ -25,6 +25,18 @@ using Convolution = ov::intel_gpu::op::Convolution;
 
 namespace ov::intel_gpu {
 
+// Returns the value of a zero-point Constant whose elements are all equal integers, so it can be passed to oneDNN as a host scalar
+static std::optional<int32_t> get_uniform_zero_point(const std::shared_ptr<ov::Node>& node) {
+    auto zp_const = ov::as_type_ptr<ov::op::v0::Constant>(node);
+    if (!zp_const || !zp_const->get_element_type().is_integral_number() || ov::shape_size(zp_const->get_shape()) == 0)
+        return std::nullopt;
+    const auto values = zp_const->cast_vector<int32_t>();
+    if (std::any_of(values.begin(), values.end(), [&](int32_t v) {
+            return v != values[0];
+        }))
+        return std::nullopt;
+    return values[0];
+}
 
 static void CreateConvolutionOp(ProgramBuilder& p, const std::shared_ptr<ov::intel_gpu::op::Convolution>& op) {
     validate_inputs_count(op, {3, 6});
@@ -74,6 +86,8 @@ static void CreateConvolutionOp(ProgramBuilder& p, const std::shared_ptr<ov::int
                                                     op->get_output_element_type(0),
                                                     auto_pad,
                                                     filter_rank);
+        prim->activations_zero_point_scalar = get_uniform_zero_point(op->get_input_node_shared_ptr(op::Convolution::Args::AZP));
+        prim->weights_zero_point_scalar = get_uniform_zero_point(op->get_input_node_shared_ptr(op::Convolution::Args::WZP));
     } else {
         prim = std::make_shared<cldnn::convolution>(layerName,
                                                     inputs[op::Convolution::Args::INPUT],

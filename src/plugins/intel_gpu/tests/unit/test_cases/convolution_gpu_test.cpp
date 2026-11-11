@@ -13745,3 +13745,144 @@ TEST(convolution_1d_small_ic_gemm_gate, rejects_input_features_above_max) {
     ASSERT_ANY_THROW(run_conv_1d(c, c.dt, "convolution_gpu_1d_small_ic_gemm"))
         << "kernel accepted IC = " << c.in_features;
 }
+
+namespace {
+struct conv_host_scalar_zp_params {
+    bool with_azp;
+    bool with_wzp;
+    bool is_dynamic;
+    bool is_caching_test;
+};
+
+// oneDNN convolution with per-tensor activations / weights zero-points that are known at compile time.
+// They are passed to oneDNN as host scalars (kernel arguments). Two convolutions with the same shapes but
+// different zero-point values check that each instance uses its own value. The result is compared with a
+// CPU reference.
+void test_onednn_conv_host_scalar_zp(const conv_host_scalar_zp_params& p) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP();
+
+    const int64_t ic = 16, oc = 16, h = 6, w = 6, k = 3;
+    const int64_t oh = h - k + 1, ow = w - k + 1;
+    const std::array<int32_t, 2> azp_values = {3, 17};
+    const std::array<int32_t, 2> wzp_values = {120, 133};
+    const auto weights_dt = p.with_wzp ? data_types::u8 : data_types::i8;
+
+    tests::random_generator rg(GET_SUITE_NAME);
+    std::vector<uint8_t> input_data(ic * h * w);
+    for (auto& v : input_data)
+        v = static_cast<uint8_t>(rg.generate_random_val<int>(0, 40, 1));
+    std::array<std::vector<int>, 2> wv;
+    for (auto& ws : wv) {
+        ws.resize(oc * ic * k * k);
+        for (auto& v : ws)
+            v = p.with_wzp ? rg.generate_random_val<int>(110, 145, 1) : rg.generate_random_val<int>(-10, 10, 1);
+    }
+
+    auto input_mem = engine.allocate_memory({ov::PartialShape{1, ic, h, w}, data_types::u8, format::bfyx});
+    set_values(input_mem, input_data);
+
+    topology topology;
+    auto in_layout = p.is_dynamic ? layout{ov::PartialShape{-1, ic, -1, -1}, data_types::u8, format::bfyx} : input_mem->get_layout();
+    topology.add(input_layout("input", in_layout));
+    for (size_t i = 0; i < 2; ++i) {
+        const auto idx = std::to_string(i);
+        auto weights_mem = engine.allocate_memory({ov::PartialShape{oc, ic, k, k}, weights_dt, format::bfyx});
+        if (p.with_wzp)
+            set_values(weights_mem, std::vector<uint8_t>(wv[i].begin(), wv[i].end()));
+        else
+            set_values(weights_mem, std::vector<int8_t>(wv[i].begin(), wv[i].end()));
+        topology.add(data("weights" + idx, weights_mem));
+
+        std::string azp_name, wzp_name;
+        if (p.with_azp) {
+            auto azp_mem = engine.allocate_memory({ov::PartialShape{1, ic, 1, 1}, data_types::u8, format::bfyx});
+            set_values(azp_mem, std::vector<uint8_t>(ic, static_cast<uint8_t>(azp_values[i])));
+            azp_name = "azp" + idx;
+            topology.add(data(azp_name, azp_mem));
+        }
+        if (p.with_wzp) {
+            auto wzp_mem = engine.allocate_memory({ov::PartialShape{1, 1, 1, 1}, data_types::u8, format::bfyx});
+            set_values(wzp_mem, std::vector<uint8_t>{static_cast<uint8_t>(wzp_values[i])});
+            wzp_name = "wzp" + idx;
+            topology.add(data(wzp_name, wzp_mem));
+        }
+        auto conv_prim = convolution("conv" + idx,
+                                     input_info("input"),
+                                     "weights" + idx,
+                                     "",
+                                     wzp_name,
+                                     azp_name,
+                                     "",
+                                     1,
+                                     {1, 1},
+                                     {1, 1},
+                                     {0, 0},
+                                     {0, 0},
+                                     false,
+                                     data_types::f32);
+        if (p.with_azp)
+            conv_prim.activations_zero_point_scalar = azp_values[i];
+        if (p.with_wzp)
+            conv_prim.weights_zero_point_scalar = wzp_values[i];
+        topology.add(conv_prim);
+        topology.add(reorder("out" + idx, input_info("conv" + idx), format::bfyx, data_types::f32));
+    }
+
+    ExecutionConfig config = get_test_default_config(engine);
+    ov::intel_gpu::ImplementationDesc conv_impl = {format::byxf, "", impl_types::onednn};
+    config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"conv0", conv_impl}, {"conv1", conv_impl}}));
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+
+    auto network = get_network(engine, topology, config, get_test_stream_ptr(), p.is_caching_test);
+    network->set_input_data("input", input_mem);
+    auto outputs = network->execute();
+
+    for (size_t i = 0; i < 2; ++i) {
+        const auto idx = std::to_string(i);
+        ASSERT_TRUE(network->get_primitive("conv" + idx)->get_impl()->is_onednn());
+        auto out_mem = outputs.at("out" + idx).get_memory();
+        mem_lock<float, mem_lock_type::read> out(out_mem, get_test_stream());
+        ASSERT_EQ(out.size(), static_cast<size_t>(oc * oh * ow));
+        const int32_t azp = p.with_azp ? azp_values[i] : 0;
+        const int32_t wzp = p.with_wzp ? wzp_values[i] : 0;
+        for (int64_t o = 0; o < oc; ++o) {
+            for (int64_t y = 0; y < oh; ++y) {
+                for (int64_t x = 0; x < ow; ++x) {
+                    int32_t acc = 0;
+                    for (int64_t c = 0; c < ic; ++c)
+                        for (int64_t ky = 0; ky < k; ++ky)
+                            for (int64_t kx = 0; kx < k; ++kx)
+                                acc +=
+                                    (static_cast<int32_t>(input_data[(c * h + y + ky) * w + x + kx]) - azp) * (wv[i][((o * ic + c) * k + ky) * k + kx] - wzp);
+                    ASSERT_EQ(static_cast<float>(acc), out[(o * oh + y) * ow + x]) << "conv" << i << " o=" << o << " y=" << y << " x=" << x;
+                }
+            }
+        }
+    }
+}
+}  // namespace
+
+TEST(convolution_onednn_host_scalar, per_tensor_azp) {
+    test_onednn_conv_host_scalar_zp({true, false, false, false});
+}
+TEST(convolution_onednn_host_scalar, scalar_wzp) {
+    test_onednn_conv_host_scalar_zp({false, true, false, false});
+}
+TEST(convolution_onednn_host_scalar, per_tensor_azp_scalar_wzp) {
+    test_onednn_conv_host_scalar_zp({true, true, false, false});
+}
+TEST(convolution_onednn_host_scalar, per_tensor_azp_dynamic) {
+    test_onednn_conv_host_scalar_zp({true, false, true, false});
+}
+TEST(convolution_onednn_host_scalar, per_tensor_azp_scalar_wzp_dynamic) {
+    test_onednn_conv_host_scalar_zp({true, true, true, false});
+}
+TEST(convolution_onednn_host_scalar, per_tensor_azp_cached) {
+    test_onednn_conv_host_scalar_zp({true, false, false, true});
+}
+TEST(convolution_onednn_host_scalar, per_tensor_azp_scalar_wzp_cached) {
+    test_onednn_conv_host_scalar_zp({true, true, false, true});
+}

@@ -190,6 +190,10 @@ std::string convolution_inst::to_string(convolution_node const& node) {
     conv_info.add("groups", desc->groups);
     conv_info.add("has zero points for weights", w_zp);
     conv_info.add("has zero points for activations", a_zp);
+    if (desc->weights_zero_point_scalar.has_value())
+        conv_info.add("weights zero point value", desc->weights_zero_point_scalar.value());
+    if (desc->activations_zero_point_scalar.has_value())
+        conv_info.add("activations zero point value", desc->activations_zero_point_scalar.value());
     node_info->add("convolution info", conv_info);
     node_info->dump(primitive_description);
 
