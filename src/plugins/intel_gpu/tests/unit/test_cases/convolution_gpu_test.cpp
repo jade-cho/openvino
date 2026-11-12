@@ -13831,8 +13831,12 @@ void test_onednn_conv_host_scalar_zp(const conv_host_scalar_zp_params& p) {
     }
 
     ExecutionConfig config = get_test_default_config(engine);
-    ov::intel_gpu::ImplementationDesc conv_impl = {format::byxf, "", impl_types::onednn};
-    config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"conv0", conv_impl}, {"conv1", conv_impl}}));
+    // oneDNN convolution has no shape-agnostic impl, so it can't be forced on a dynamic node. In the dynamic case the
+    // static oneDNN impls are created at runtime for the actual shape (and can be shared through the impls cache).
+    if (!p.is_dynamic) {
+        ov::intel_gpu::ImplementationDesc conv_impl = {format::byxf, "", impl_types::onednn};
+        config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"conv0", conv_impl}, {"conv1", conv_impl}}));
+    }
     config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
     config.set_property(ov::intel_gpu::optimize_data(true));
 
